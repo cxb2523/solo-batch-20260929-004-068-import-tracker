@@ -5,6 +5,8 @@ through import statements
 # Standard
 from types import ModuleType
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
+import ast
+import builtins
 import dis
 import importlib
 import os
@@ -669,3 +671,456 @@ def _flatten_deps(
         for mod, opt_vals in optional_deps_map.items()
     }
     return flat_base_deps, optional_deps_map
+
+
+## AST-Based Single-File Import Tracking #######################################
+
+
+def track_imports(source: str, filename: str = "<unknown>") -> Dict[str, Any]:
+    """Track the imports of a single python source file with a single AST
+    traversal, attributing each import to its lexical scope and conditional
+    branch path and determining which imports are actually used.
+
+    Args:
+        source:  str
+            The python source code to analyze
+        filename:  str
+            The name of the file the source came from (used in the report only)
+
+    Returns:
+        report:  Dict[str, Any]
+            A deterministic, JSON-serializable report with the keys:
+                - filename: The filename passed in
+                - imports: Ordered list of import entries. Each entry holds
+                    "symbol", "module", "name", "alias", "scope", "depth",
+                    "branches", "lineno", "star", "type_checking" and "used".
+                - unused: Ordered list of unused import entries
+                - unresolved: Sorted list of referenced names that could not be
+                    attributed to any import or local binding
+                - star_attributions: Mapping from names that could only be
+                    resolved through a "from x import *" to the module x
+    """
+    tree = ast.parse(source, filename=filename)
+    visitor = _ImportVisitor()
+    visitor.visit(tree)
+    unresolved, star_attributions = _resolve_usage(visitor.all_scopes)
+
+    imports = []
+    unused = []
+    for scope in visitor.all_scopes:
+        for entry in scope.symbols.values():
+            imports.append(
+                {key: val for key, val in entry.items() if not key.startswith("_")}
+            )
+            if not entry["used"] and not entry["star"]:
+                unused.append(
+                    {
+                        "symbol": entry["symbol"],
+                        "module": entry["module"],
+                        "scope": entry["scope"],
+                        "lineno": entry["lineno"],
+                    }
+                )
+
+    return {
+        "filename": filename,
+        "imports": imports,
+        "unused": unused,
+        "unresolved": sorted(unresolved),
+        "star_attributions": {
+            name: star_attributions[name] for name in sorted(star_attributions)
+        },
+    }
+
+
+def format_import_report(report: Dict[str, Any], indent: int = 2) -> str:
+    """Format the report produced by track_imports as an indented attribution
+    listing grouped by scope for manual inspection.
+    """
+    unit = " " * indent
+    lines = []
+    current_scope = None
+    for entry in report["imports"]:
+        if entry["scope"] != current_scope:
+            current_scope = entry["scope"]
+            lines.append("{}{}:".format(unit * entry["depth"], current_scope or "<module>"))
+        status = "used" if entry["used"] else "unused"
+        line = "{}{} -> {} [{}]".format(
+            unit * (entry["depth"] + 1), entry["symbol"], entry["module"], status
+        )
+        if entry["branches"]:
+            line += " (branches: {})".format(", ".join(entry["branches"]))
+        lines.append(line)
+    if report["star_attributions"]:
+        lines.append("star attributions:")
+        for name, module in report["star_attributions"].items():
+            lines.append("{}{} -> {} (via star import)".format(unit, name, module))
+    if report["unresolved"]:
+        lines.append("unresolved: " + ", ".join(report["unresolved"]))
+    return "\n".join(lines)
+
+
+class _Scope:
+    """A single lexical scope discovered while walking the AST"""
+
+    __slots__ = (
+        "kind",
+        "path",
+        "parent",
+        "symbols",
+        "bound",
+        "used",
+        "annotations",
+        "tc_children",
+    )
+
+    def __init__(self, kind: str, path: Tuple[str, ...], parent: "_Scope" = None):
+        self.kind = kind
+        self.path = path
+        self.parent = parent
+        # Imported symbols bound in this scope: symbol -> entry (ordered)
+        self.symbols = {}
+        # Non-import names bound in this scope (assignments, defs, args, ...)
+        self.bound = set()
+        # Root names loaded at runtime directly in this scope
+        self.used = set()
+        # Names referenced from annotations (forward refs always count as used)
+        self.annotations = set()
+        # TYPE_CHECKING scopes directly nested in this scope
+        self.tc_children = []
+
+
+_BUILTIN_NAMES = set(dir(builtins))
+
+_IDENTIFIER_EXPR = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _is_str_const(node: ast.AST) -> bool:
+    """Compatibility check for string constant nodes across python versions"""
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, str)
+    return node.__class__.__name__ == "Str"  # pragma: no cover (py<3.8)
+
+
+def _names_from_string_annotation(value: str) -> Set[str]:
+    """Extract the referenced names from a string (forward reference)
+    annotation
+    """
+    try:
+        expr = ast.parse(value, mode="eval")
+    except SyntaxError:
+        return set(_IDENTIFIER_EXPR.findall(value))
+    names = set()
+    for node in ast.walk(expr):
+        if isinstance(node, ast.Name):
+            names.add(node.id)
+        elif _is_str_const(node):
+            str_val = node.value if isinstance(node, ast.Constant) else node.s
+            names.update(_names_from_string_annotation(str_val))
+    return names
+
+
+def _is_type_checking_test(test: ast.AST) -> bool:
+    """Detect `if TYPE_CHECKING:` and `if typing.TYPE_CHECKING:`"""
+    return (
+        isinstance(test, ast.Name)
+        and test.id == "TYPE_CHECKING"
+        or isinstance(test, ast.Attribute)
+        and test.attr == "TYPE_CHECKING"
+    )
+
+
+class _ImportVisitor(ast.NodeVisitor):
+    """Single-pass AST visitor that records imports, bindings and name usage
+    per lexical scope along with the conditional branch path of each import
+    """
+
+    def __init__(self):
+        self._scope_stack = [_Scope("module", ())]
+        self._branch_stack = []
+        self.all_scopes = [self._scope_stack[0]]
+
+    @property
+    def scope(self) -> _Scope:
+        return self._scope_stack[-1]
+
+    ## Scope management ##
+
+    def _push_scope(self, kind: str, name: str):
+        parent = self.scope
+        scope = _Scope(kind, parent.path + (name,), parent)
+        if kind == "type_checking":
+            parent.tc_children.append(scope)
+        self._scope_stack.append(scope)
+        self.all_scopes.append(scope)
+
+    def _pop_scope(self):
+        self._scope_stack.pop()
+
+    ## Import recording ##
+
+    def _add_import(
+        self,
+        symbol: str,
+        module: str,
+        name: Optional[str],
+        alias: Optional[str],
+        lineno: int,
+        star: bool = False,
+    ):
+        scope = self.scope
+        branch = list(self._branch_stack)
+        existing = scope.symbols.get(symbol)
+        if existing is not None:
+            # Merge repeated imports of the same symbol within this scope into
+            # a single entry, accumulating the branch paths of all occurrences
+            for label in branch:
+                if label not in existing["branches"]:
+                    existing["branches"].append(label)
+            # On conflict, the top-level (unbranched) occurrence wins
+            if existing["_branched"] and not branch:
+                existing.update(
+                    {
+                        "module": module,
+                        "name": name,
+                        "alias": alias,
+                        "lineno": lineno,
+                        "star": star,
+                        "_branched": False,
+                    }
+                )
+            return
+        scope.symbols[symbol] = {
+            "symbol": symbol,
+            "module": module,
+            "name": name,
+            "alias": alias,
+            "scope": ".".join(scope.path),
+            "depth": len(scope.path),
+            "type_checking": scope.kind == "type_checking",
+            "lineno": lineno,
+            "branches": branch,
+            "star": star,
+            "used": False,
+            "_branched": bool(branch),
+        }
+
+    ## Node visitors ##
+
+    def visit_Import(self, node: ast.Import):
+        for alias in node.names:
+            self._add_import(
+                symbol=alias.asname or alias.name.partition(".")[0],
+                module=alias.name,
+                name=None,
+                alias=alias.asname,
+                lineno=node.lineno,
+            )
+
+    def visit_ImportFrom(self, node: ast.ImportFrom):
+        module = "." * node.level + (node.module or "")
+        for alias in node.names:
+            if alias.name == "*":
+                self._add_import(
+                    symbol="*",
+                    module=module,
+                    name="*",
+                    alias=None,
+                    lineno=node.lineno,
+                    star=True,
+                )
+            else:
+                self._add_import(
+                    symbol=alias.asname or alias.name,
+                    module=module,
+                    name=alias.name,
+                    alias=alias.asname,
+                    lineno=node.lineno,
+                )
+
+    def visit_Name(self, node: ast.Name):
+        if isinstance(node.ctx, ast.Load):
+            self.scope.used.add(node.id)
+        else:
+            self.scope.bound.add(node.id)
+
+    def visit_If(self, node: ast.If):
+        self.visit(node.test)
+        label = "if@{}".format(node.lineno)
+        if _is_type_checking_test(node.test):
+            self._push_scope("type_checking", "TYPE_CHECKING")
+            self._branch_stack.append(label + ":body")
+            for stmt in node.body:
+                self.visit(stmt)
+            self._branch_stack.pop()
+            self._pop_scope()
+        else:
+            self._branch_stack.append(label + ":body")
+            for stmt in node.body:
+                self.visit(stmt)
+            self._branch_stack.pop()
+        self._branch_stack.append(label + ":orelse")
+        for stmt in node.orelse:
+            self.visit(stmt)
+        self._branch_stack.pop()
+
+    def _visit_try(self, node):
+        label = "try@{}".format(node.lineno)
+        self._branch_stack.append(label + ":body")
+        for stmt in node.body:
+            self.visit(stmt)
+        self._branch_stack.pop()
+        for idx, handler in enumerate(node.handlers):
+            if handler.type:
+                self.visit(handler.type)
+            if handler.name:
+                self.scope.bound.add(handler.name)
+            self._branch_stack.append("{}:handler{}".format(label, idx))
+            for stmt in handler.body:
+                self.visit(stmt)
+            self._branch_stack.pop()
+        for part, stmts in (("orelse", node.orelse), ("finalbody", node.finalbody)):
+            self._branch_stack.append("{}:{}".format(label, part))
+            for stmt in stmts:
+                self.visit(stmt)
+            self._branch_stack.pop()
+
+    def visit_Try(self, node: ast.Try):
+        self._visit_try(node)
+
+    def visit_TryStar(self, node):  # python 3.11+
+        self._visit_try(node)
+
+    def _record_annotation(self, annotation: Optional[ast.AST]):
+        """Names referenced in annotations (including string forward
+        references) always count as used
+        """
+        if annotation is None:
+            return
+        if _is_str_const(annotation):
+            str_val = (
+                annotation.value
+                if isinstance(annotation, ast.Constant)
+                else annotation.s
+            )
+            self.scope.annotations.update(_names_from_string_annotation(str_val))
+            return
+        self.visit(annotation)
+        for sub_node in ast.walk(annotation):
+            if _is_str_const(sub_node):
+                str_val = (
+                    sub_node.value
+                    if isinstance(sub_node, ast.Constant)
+                    else sub_node.s
+                )
+                self.scope.annotations.update(_names_from_string_annotation(str_val))
+
+    def _visit_arguments(self, args: ast.arguments):
+        all_args = list(getattr(args, "posonlyargs", []))
+        all_args += list(args.args) + list(args.kwonlyargs)
+        for arg in all_args + [args.vararg, args.kwarg]:
+            if arg is None:
+                continue
+            self.scope.bound.add(arg.arg)
+            self._record_annotation(arg.annotation)
+        for default in list(args.defaults) + list(args.kw_defaults):
+            if default is not None:
+                self.visit(default)
+
+    def _visit_function_def(self, node):
+        self.scope.bound.add(node.name)
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        # Signature annotations and defaults are evaluated in the enclosing
+        # scope
+        self._visit_arguments(node.args)
+        self._record_annotation(node.returns)
+        self._push_scope("function", node.name)
+        for stmt in node.body:
+            self.visit(stmt)
+        self._pop_scope()
+
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        self._visit_function_def(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
+        self._visit_function_def(node)
+
+    def visit_ClassDef(self, node: ast.ClassDef):
+        self.scope.bound.add(node.name)
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        for base in node.bases:
+            self.visit(base)
+        for keyword in node.keywords:
+            self.visit(keyword)
+        self._push_scope("class", node.name)
+        for stmt in node.body:
+            self.visit(stmt)
+        self._pop_scope()
+
+    def visit_Lambda(self, node: ast.Lambda):
+        self._visit_arguments(node.args)
+        self.visit(node.body)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign):
+        self._record_annotation(node.annotation)
+        self.visit(node.target)
+        if node.value is not None:
+            self.visit(node.value)
+
+
+def _resolve_usage(scopes: List[_Scope]) -> Tuple[Set[str], Dict[str, str]]:
+    """Walk every scope's referenced names up the scope chain, marking the
+    imports they resolve to as used. Names that cannot be attributed to any
+    import or binding are either conservatively attributed to a visible
+    "from x import *" or reported as unresolved.
+    """
+    unresolved = set()
+    star_attributions = {}
+    for scope in scopes:
+        for name in sorted(scope.used):
+            _resolve_name(scope, name, False, unresolved, star_attributions)
+        for name in sorted(scope.annotations):
+            _resolve_name(scope, name, True, unresolved, star_attributions)
+    return unresolved, star_attributions
+
+
+def _resolve_name(
+    scope: _Scope,
+    name: str,
+    is_annotation: bool,
+    unresolved: Set[str],
+    star_attributions: Dict[str, str],
+):
+    current = scope
+    while current is not None:
+        entry = current.symbols.get(name)
+        if entry is not None:
+            entry["used"] = True
+            return
+        if name in current.bound:
+            return
+        # Annotation (forward) references may resolve to imports that live in
+        # an `if TYPE_CHECKING:` block nested in this scope
+        if is_annotation:
+            for tc_scope in current.tc_children:
+                tc_entry = tc_scope.symbols.get(name)
+                if tc_entry is not None:
+                    tc_entry["used"] = True
+                    return
+        current = current.parent
+    # Builtins and dunders are never missing references
+    if name in _BUILTIN_NAMES or (name.startswith("__") and name.endswith("__")):
+        return
+    # Conservatively attribute unknown names to a visible "from x import *",
+    # but only within the scopes where that star import is visible
+    current = scope
+    while current is not None:
+        star_entry = current.symbols.get("*")
+        if star_entry is not None:
+            star_entry["used"] = True
+            star_attributions.setdefault(name, star_entry["module"])
+            return
+        current = current.parent
+    unresolved.add(name)

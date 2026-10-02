@@ -12,6 +12,9 @@ python -m import_tracker --name my_library --recursive --num_jobs 2
 
 # Track a module with relative import syntax
 python -m import_tracker --name .my_sub_module --package my_library
+
+# Print an indented import attribution listing for a single file
+python -m import_tracker --file path/to/my_module.py
 """
 
 # Standard
@@ -21,7 +24,7 @@ import logging
 import os
 
 # Local
-from .import_tracker import track_module
+from .import_tracker import format_import_report, track_imports, track_module
 
 ## Main ########################################################################
 
@@ -34,8 +37,14 @@ def main():
     parser.add_argument(
         "--name",
         "-n",
-        required=True,
         help="Module name to track",
+    )
+    parser.add_argument(
+        "--file",
+        "-F",
+        default=None,
+        help="Path to a single python file to analyze with AST-based import "
+        "tracking. Prints an indented per-scope attribution listing.",
     )
     parser.add_argument(
         "--package",
@@ -105,6 +114,17 @@ def main():
     if log_level is None:
         log_level = int(args.log_level)
     logging.basicConfig(level=log_level)
+
+    # Single-file AST tracking mode
+    if args.file:
+        with open(args.file, "r", encoding="utf-8") as handle:
+            source = handle.read()
+        report = track_imports(source, filename=args.file)
+        print(format_import_report(report, indent=args.indent or 2))
+        return
+
+    if not args.name:
+        parser.error("--name is required unless --file is given")
 
     # Perform the tracking and print out the output
     print(
