@@ -12,6 +12,9 @@ python -m import_tracker --name my_library --recursive --num_jobs 2
 
 # Track a module with relative import syntax
 python -m import_tracker --name .my_sub_module --package my_library
+
+# Print an indented attribution listing for a single source file
+python -m import_tracker --file path/to/my_module.py
 """
 
 # Standard
@@ -21,7 +24,7 @@ import logging
 import os
 
 # Local
-from .import_tracker import track_module
+from .import_tracker import format_file_report, track_module
 
 ## Main ########################################################################
 
@@ -34,8 +37,13 @@ def main():
     parser.add_argument(
         "--name",
         "-n",
-        required=True,
         help="Module name to track",
+        default=None,
+    )
+    parser.add_argument(
+        "--file",
+        help="Print an indented attribution listing for a single source file",
+        default=None,
     )
     parser.add_argument(
         "--package",
@@ -92,6 +100,18 @@ def main():
         help="Default log level",
     )
     args = parser.parse_args()
+
+    if args.file is not None and args.name is not None:
+        parser.error("--file cannot be combined with --name")
+    if args.file is None and args.name is None:
+        parser.error("one of --name or --file is required")
+
+    # The file mode performs static AST analysis of a single source file and
+    # prints an indented attribution listing for manual inspection
+    if args.file is not None:
+        indent = args.indent if args.indent is not None else 2
+        print(format_file_report(args.file, indent=indent))
+        return
 
     # Determine the submodules argument value
     submodules = (

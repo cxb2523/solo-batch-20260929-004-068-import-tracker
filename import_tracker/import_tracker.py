@@ -5,17 +5,139 @@ through import statements
 # Standard
 from types import ModuleType
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
+from dataclasses import dataclass, field
+import ast
 import dis
 import importlib
 import os
 import re
 import sys
+import tokenize
 
 # Local
 from . import constants
 from .log import log
 
 ## Public ######################################################################
+
+
+@dataclass(frozen=True)
+class ImportEntry:
+    """A single merged import binding (one local name -> one source module)
+
+    Multiple ``import`` statements binding the same name within the same scope
+    (e.g. across the branches of an ``if``) are merged into one entry.
+    """
+
+    name: str
+    module: str
+    imported: Optional[str]
+    lineno: int
+    col: int
+    scope_depth: int
+    scope: str
+    branches: Tuple[Tuple[str, ...], ...]
+    type_checking: bool
+    used: bool
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to a json-serializable dict with a stable key order"""
+        return {
+            "name": self.name,
+            "module": self.module,
+            "imported": self.imported,
+            "lineno": self.lineno,
+            "col": self.col,
+            "scope_depth": self.scope_depth,
+            "scope": self.scope,
+            "branches": [list(path) for path in self.branches],
+            "type_checking": self.type_checking,
+            "used": self.used,
+        }
+
+
+@dataclass(frozen=True)
+class MissingRef:
+    """A referenced name that could not be resolved to any binding"""
+
+    name: str
+    lineno: int
+    col: int
+    scope_depth: int
+    scope: str
+    attributed_to: Optional[str]
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to a json-serializable dict with a stable key order"""
+        return {
+            "name": self.name,
+            "lineno": self.lineno,
+            "col": self.col,
+            "scope_depth": self.scope_depth,
+            "scope": self.scope,
+            "attributed_to": self.attributed_to,
+        }
+
+
+@dataclass(frozen=True)
+class ImportReport:
+    """The full result of :func:`track_imports` for one source file"""
+
+    imports: Tuple[ImportEntry, ...]
+    missing: Tuple[MissingRef, ...]
+
+    @property
+    def unused(self) -> Tuple[ImportEntry, ...]:
+        """All merged import entries that were never referenced"""
+        return tuple(entry for entry in self.imports if not entry.used)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to a json-serializable dict with a stable key order"""
+        return {
+            "imports": [entry.to_dict() for entry in self.imports],
+            "unused": [entry.to_dict() for entry in self.unused],
+            "missing": [missing.to_dict() for missing in self.missing],
+        }
+
+
+def track_imports(
+    source: Union[str, "os.PathLike[str]"],
+    *,
+    is_file: Optional[bool] = None,
+) -> ImportReport:
+    """Statically track the imports of a single python file via its AST
+
+    The AST is traversed exactly once. Each import records the lexical scope
+    depth and conditional branch path in which it appears. Usage is resolved
+    per lexical scope, so imports inside function bodies, class bodies and
+    ``if TYPE_CHECKING`` blocks never leak into the module-level symbol table.
+
+    Args:
+        source:  Union[str, os.PathLike]
+            Either python source code or the path to a python file.
+        is_file:  Optional[bool]
+            Force ``source`` to be interpreted as a path (True) or as code
+            (False). If None, existing paths are treated as files.
+
+    Returns:
+        ImportReport
+    """
+    filename, src = _read_source(source, is_file)
+    tree = ast.parse(src, filename=filename or "<source>")
+    visitor = _ImportTrackingVisitor()
+    visitor.visit(tree)
+    return visitor.build_report()
+
+
+def format_file_report(
+    source: Union[str, "os.PathLike[str]"],
+    *,
+    is_file: Optional[bool] = None,
+    indent: int = 2,
+) -> str:
+    """Render a human-readable, indented attribution listing for one file"""
+    report = track_imports(source, is_file=is_file)
+    return _render_report(report, indent)
 
 
 def track_module(
@@ -669,3 +791,718 @@ def _flatten_deps(
         for mod, opt_vals in optional_deps_map.items()
     }
     return flat_base_deps, optional_deps_map
+
+
+## AST Import Tracking #########################################################
+
+
+if isinstance(__builtins__, dict):  # pragma: no cover - depends on runner
+    _BUILTIN_NAMES = set(__builtins__.keys())
+else:
+    _BUILTIN_NAMES = set(dir(__builtins__))
+_BUILTIN_NAMES.update(
+    {
+        "__file__",
+        "__name__",
+        "__doc__",
+        "__package__",
+        "__loader__",
+        "__spec__",
+        "__builtins__",
+        "__cached__",
+    }
+)
+
+
+def _read_source(
+    source: Union[str, "os.PathLike[str]"], is_file: Optional[bool]
+) -> Tuple[Optional[str], str]:
+    """Return (filename, source_text) for the given source argument"""
+    path_str = os.fspath(source)
+    if is_file is True or (is_file is None and os.path.isfile(path_str)):
+        with tokenize.open(path_str) as handle:
+            return os.path.abspath(path_str), handle.read()
+    return None, source
+
+
+@dataclass
+class _RawImport:
+    """An unmerged import binding as found during the single AST walk"""
+
+    name: str
+    module: Optional[str]
+    imported: Optional[str]
+    lineno: int
+    col: int
+    scope: "_Scope"
+    branches: Tuple[Tuple[str, bool], ...]
+    star: bool = False
+    used: bool = False
+
+
+@dataclass
+class _Load:
+    """A name load as found during the single AST walk"""
+
+    name: str
+    lineno: int
+    col: int
+    scope: "_Scope"
+    annotation: bool
+
+
+@dataclass
+class _Scope:
+    """One lexical scope collected during the single AST walk"""
+
+    scope_id: int
+    kind: str
+    label: str
+    qualified: str
+    depth: int
+    parent: Optional["_Scope"]
+    bindings: Set[str] = field(default_factory=set)
+    globals: Set[str] = field(default_factory=set)
+    nonlocals: Set[str] = field(default_factory=set)
+    imports: List[_RawImport] = field(default_factory=list)
+    stars: List[_RawImport] = field(default_factory=list)
+    loads: List[_Load] = field(default_factory=list)
+
+
+def _safe_unparse(node: Optional[ast.AST]) -> str:
+    """Best-effort compact source rendering of an expression node"""
+    if node is None:
+        return ""
+    try:
+        return re.sub(r"\s+", " ", ast.unparse(node)).strip()
+    except Exception:  # pragma: no cover - unparse is robust on 3.9+
+        return type(node).__name__
+
+
+def _is_type_checking_test(node: ast.AST) -> bool:
+    """True if the expression is a plain ``TYPE_CHECKING`` style reference"""
+    if isinstance(node, ast.Name):
+        return node.id == "TYPE_CHECKING"
+    if isinstance(node, ast.Attribute):
+        return node.attr == "TYPE_CHECKING"
+    return False
+
+
+class _ImportTrackingVisitor(ast.NodeVisitor):
+    """Single-pass AST visitor recording scopes, imports and name loads"""
+
+    def __init__(self) -> None:
+        self.module_scope = _Scope(
+            scope_id=0,
+            kind="module",
+            label="<module>",
+            qualified="<module>",
+            depth=0,
+            parent=None,
+        )
+        self.scopes: List[_Scope] = [self.module_scope]
+        self.scope_stack: List[_Scope] = [self.module_scope]
+        self.branch_stack: List[Tuple[str, bool]] = []
+        self.next_scope_id = 1
+        self._annotation_depth = 0
+
+    @property
+    def scope(self) -> _Scope:
+        return self.scope_stack[-1]
+
+    def _push_scope(self, kind: str, label: str) -> _Scope:
+        parent = self.scope_stack[-1]
+        scope = _Scope(
+            scope_id=self.next_scope_id,
+            kind=kind,
+            label=label,
+            qualified=f"{parent.qualified}::{label}",
+            depth=len(self.scope_stack),
+            parent=parent,
+        )
+        self.next_scope_id += 1
+        self.scopes.append(scope)
+        self.scope_stack.append(scope)
+        return scope
+
+    def _pop_scope(self) -> None:
+        self.scope_stack.pop()
+
+    def _branch_block(
+        self, label: str, type_checking: bool, statements: Iterable[ast.AST]
+    ) -> None:
+        self.branch_stack.append((label, type_checking))
+        try:
+            for statement in statements:
+                self.visit(statement)
+        finally:
+            self.branch_stack.pop()
+
+    def _record_import(
+        self,
+        node: Union[ast.Import, ast.ImportFrom],
+        module: Optional[str],
+        imported: Optional[str],
+        name: str,
+        star: bool = False,
+    ) -> None:
+        raw = _RawImport(
+            name=name,
+            module=module,
+            imported=imported,
+            lineno=node.lineno,
+            col=node.col_offset,
+            scope=self.scope,
+            branches=tuple(self.branch_stack),
+            star=star,
+        )
+        if star:
+            self.scope.stars.append(raw)
+        else:
+            self.scope.imports.append(raw)
+            self.scope.bindings.add(name)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            bound = alias.asname or alias.name.split(".")[0]
+            self._record_import(node, alias.name, None, bound)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        module = ("." * (node.level or 0)) + (node.module or "")
+        for alias in node.names:
+            if alias.name == "*":
+                self._record_import(node, module, "*", "*", star=True)
+            else:
+                bound = alias.asname or alias.name
+                self._record_import(node, module, alias.name, bound)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, (ast.Store, ast.Del)):
+            self.scope.bindings.add(node.id)
+        else:
+            self.scope.loads.append(
+                _Load(
+                    name=node.id,
+                    lineno=node.lineno,
+                    col=node.col_offset,
+                    scope=self.scope,
+                    annotation=self._annotation_depth > 0,
+                )
+            )
+        self.generic_visit(node)
+
+    def visit_Global(self, node: ast.Global) -> None:
+        self.scope.globals.update(node.names)
+
+    def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
+        self.scope.nonlocals.update(node.names)
+
+    def _bind_targets(self, target: ast.AST) -> None:
+        for sub in ast.walk(target):
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                self.scope.bindings.add(sub.id)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.visit(node.value)
+        for target in node.targets:
+            self.visit(target)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        self.visit(node.target)
+        self.visit(node.value)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self.visit(node.target)
+        self._collect_annotation(node.annotation)
+        if node.value is not None:
+            self.visit(node.value)
+
+    def visit_For(self, node: ast.For) -> None:
+        self._visit_loop(node)
+
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+        self._visit_loop(node)
+
+    def _visit_loop(self, node: ast.AST) -> None:
+        self.visit(node.iter)
+        self.visit(node.target)
+        label = f"for:{_safe_unparse(node.iter)}"
+        self._branch_block(label, False, node.body)
+        if node.orelse:
+            self._branch_block("for:else", False, node.orelse)
+
+    def visit_While(self, node: ast.While) -> None:
+        self.visit(node.test)
+        self._branch_block(f"while:{_safe_unparse(node.test)}", False, node.body)
+        if node.orelse:
+            self._branch_block("while:else", False, node.orelse)
+
+    def visit_With(self, node: ast.With) -> None:
+        for item in node.items:
+            self.visit(item.context_expr)
+            if item.optional_vars is not None:
+                self.visit(item.optional_vars)
+        label = "with:" + ",".join(
+            _safe_unparse(item.context_expr) for item in node.items
+        )
+        self._branch_block(label, False, node.body)
+
+    def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
+        self.visit_With(node)
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+        if node.type is not None:
+            self.visit(node.type)
+        if node.name is not None:
+            self.scope.bindings.add(node.name)
+        label = (
+            f"except:{_safe_unparse(node.type)}"
+            if node.type is not None
+            else "except"
+        )
+        self._branch_block(label, False, node.body)
+
+    @staticmethod
+    def _all_arg_nodes(args: ast.arguments) -> List[ast.arg]:
+        all_args: List[ast.arg] = []
+        all_args.extend(args.posonlyargs)
+        all_args.extend(args.args)
+        all_args.extend(args.kwonlyargs)
+        if args.vararg is not None:
+            all_args.append(args.vararg)
+        if args.kwarg is not None:
+            all_args.append(args.kwarg)
+        return all_args
+
+    def _collect_annotation(self, annotation: ast.AST) -> None:
+        """Visit an annotation expression in the current (enclosing) scope
+
+        String forward references are parsed and treated as used.
+        """
+        self._annotation_depth += 1
+        try:
+            if isinstance(annotation, ast.Constant) and isinstance(
+                annotation.value, str
+            ):
+                self._collect_string_annotation(annotation.value)
+            else:
+                self.visit(annotation)
+        finally:
+            self._annotation_depth -= 1
+
+    def _collect_string_annotation(self, value: str) -> None:
+        try:
+            parsed = ast.parse(value, mode="eval")
+        except SyntaxError:
+            return
+        self.visit(parsed.body)
+
+    def _visit_arguments_enclosing(self, args: ast.arguments) -> None:
+        """Visit defaults in the enclosing scope, annotations included"""
+        for default in args.defaults:
+            self.visit(default)
+        for default in args.kw_defaults:
+            if default is not None:
+                self.visit(default)
+        for arg in self._all_arg_nodes(args):
+            if arg.annotation is not None:
+                self._collect_annotation(arg.annotation)
+
+    @staticmethod
+    def _param_names(args: ast.arguments) -> List[str]:
+        names = [arg.arg for arg in _ImportTrackingVisitor._all_arg_nodes(args)]
+        return names
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._visit_function(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._visit_function(node)
+
+    def _visit_function(
+        self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]
+    ) -> None:
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        self._visit_arguments_enclosing(node.args)
+        if node.returns is not None:
+            self._collect_annotation(node.returns)
+        self.scope.bindings.add(node.name)
+        scope = self._push_scope("function", f"{type(node).__name__}:{node.name}")
+        try:
+            scope.bindings.update(self._param_names(node.args))
+            for statement in node.body:
+                self.visit(statement)
+        finally:
+            self._pop_scope()
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        for default in node.args.defaults:
+            self.visit(default)
+        for default in node.args.kw_defaults:
+            if default is not None:
+                self.visit(default)
+        for arg in self._all_arg_nodes(node.args):
+            if arg.annotation is not None:
+                self._collect_annotation(arg.annotation)
+        scope = self._push_scope("function", "Lambda")
+        try:
+            scope.bindings.update(self._param_names(node.args))
+            self.visit(node.body)
+        finally:
+            self._pop_scope()
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        for base in node.bases:
+            self.visit(base)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
+        self.scope.bindings.add(node.name)
+        scope = self._push_scope("class", f"ClassDef:{node.name}")
+        try:
+            for statement in node.body:
+                self.visit(statement)
+        finally:
+            self._pop_scope()
+
+    def _visit_comprehension(
+        self,
+        node: ast.AST,
+        generators: List[ast.comprehension],
+        *results: ast.AST,
+    ) -> None:
+        first = generators[0]
+        self.visit(first.iter)
+        scope = self._push_scope("function", type(node).__name__)
+        try:
+            for idx, comp in enumerate(generators):
+                if idx > 0:
+                    self.visit(comp.iter)
+                self._bind_targets(comp.target)
+                for condition in comp.ifs:
+                    self.visit(condition)
+            for result in results:
+                self.visit(result)
+        finally:
+            self._pop_scope()
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        self._visit_comprehension(node, node.generators, node.elt)
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        self._visit_comprehension(node, node.generators, node.elt)
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        self._visit_comprehension(node, node.generators, node.elt)
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        self._visit_comprehension(node, node.generators, node.key, node.value)
+
+    def visit_If(self, node: ast.If) -> None:
+        self.visit(node.test)
+        body_tc = _is_type_checking_test(node.test)
+        body_label = (
+            "if TYPE_CHECKING"
+            if body_tc
+            else f"if:{_safe_unparse(node.test)}"
+        )
+        self._branch_block(body_label, body_tc, node.body)
+        if node.orelse:
+            if (
+                len(node.orelse) == 1
+                and isinstance(node.orelse[0], ast.If)
+            ):
+                self.visit(node.orelse[0])
+            else:
+                else_tc = isinstance(node.test, ast.UnaryOp) and isinstance(
+                    node.test.op, ast.Not
+                ) and _is_type_checking_test(node.test.operand)
+                self._branch_block(
+                    "else",
+                    else_tc,
+                    node.orelse,
+                )
+
+    def visit_Try(self, node: ast.Try) -> None:
+        self._branch_block("try", False, node.body)
+        for handler in node.handlers:
+            self.visit(handler)
+        self._branch_block("try:else", False, node.orelse)
+        self._branch_block("finally", False, node.finalbody)
+
+    if hasattr(ast, "TryStar"):
+
+        def visit_TryStar(self, node: ast.TryStar) -> None:
+            self.visit_Try(node)
+
+    def visit_Match(self, node: ast.Match) -> None:
+        self.visit(node.subject)
+        for case in node.cases:
+            self._visit_pattern_values(case.pattern)
+            self._match_pattern_bindings(case.pattern)
+            label = f"case:{_safe_unparse(case.pattern)}"
+            if case.guard is not None:
+                self.visit(case.guard)
+            self._branch_block(label, False, case.body)
+
+    def _visit_pattern_values(self, pattern: ast.AST) -> None:
+        """Visit only the runtime-value parts of a match pattern"""
+        if isinstance(pattern, ast.MatchValue):
+            self.visit(pattern.value)
+        elif isinstance(pattern, ast.MatchSingleton):
+            return
+        elif isinstance(pattern, ast.MatchSequence):
+            for sub in pattern.patterns:
+                self._visit_pattern_values(sub)
+        elif isinstance(pattern, ast.MatchMapping):
+            for key in pattern.keys:
+                self.visit(key)
+            for sub in pattern.patterns:
+                self._visit_pattern_values(sub)
+        elif isinstance(pattern, ast.MatchClass):
+            self.visit(pattern.cls)
+            for sub in pattern.patterns:
+                self._visit_pattern_values(sub)
+            for kwd in pattern.kwd_patterns:
+                self._visit_pattern_values(kwd)
+        elif isinstance(pattern, ast.MatchOr):
+            for sub in pattern.patterns:
+                self._visit_pattern_values(sub)
+
+    def _match_pattern_bindings(self, pattern: Optional[ast.AST]) -> None:
+        if pattern is None:
+            return
+        if isinstance(pattern, ast.MatchAs) and pattern.name is not None:
+            self.scope.bindings.add(pattern.name)
+        for child in ast.iter_child_nodes(pattern):
+            self._match_pattern_bindings(child)
+
+    if hasattr(ast, "TypeAlias"):
+
+        def visit_TypeAlias(self, node: ast.TypeAlias) -> None:
+            self.visit(node.name)
+            self._collect_annotation(node.value)
+
+    def _resolution_chain(self, scope: _Scope) -> List[_Scope]:
+        """Lexical resolution chain, skipping class scopes from functions"""
+        chain: List[_Scope] = []
+        current: Optional[_Scope] = scope
+        while current is not None:
+            chain.append(current)
+            next_scope = current.parent
+            parent = current.parent
+            if current.kind in ("function",) and parent is not None:
+                while parent is not None and parent.kind == "class":
+                    parent = parent.parent
+                next_scope = parent
+            current = next_scope
+        return chain
+
+    def build_report(self) -> ImportReport:
+        """Resolve names against collected scopes and build the final report"""
+        missing: List[Tuple[str, int, int, _Scope, Optional[str]]] = []
+        for scope in self.scopes:
+            for load in scope.loads:
+                self._resolve_load(load, scope, missing)
+
+        entries: List[ImportEntry] = []
+        groups: Dict[Tuple[int, str], List[_RawImport]] = {}
+        for scope in self.scopes:
+            for raw in scope.imports:
+                groups.setdefault((scope.scope_id, raw.name), []).append(raw)
+            for raw in scope.stars:
+                groups.setdefault((scope.scope_id, f"*:{raw.lineno}:{raw.col}"), [raw])
+
+        for _, raws in groups.items():
+            entries.append(self._merge_raw_imports(raws))
+
+        entries.sort(key=lambda entry: (entry.lineno, entry.col, entry.name))
+
+        missing_records = []
+        seen = set()
+        for name, lineno, col, scope, attributed in missing:
+            key = (name, lineno, col, scope.scope_id, attributed or "")
+            if key in seen:
+                continue
+            seen.add(key)
+            missing_records.append(
+                MissingRef(
+                    name=name,
+                    lineno=lineno,
+                    col=col,
+                    scope_depth=scope.depth,
+                    scope=scope.qualified,
+                    attributed_to=attributed,
+                )
+            )
+        missing_records.sort(key=lambda ref: (ref.lineno, ref.col, ref.name))
+
+        return ImportReport(
+            imports=tuple(entries),
+            missing=tuple(missing_records),
+        )
+
+    def _resolve_load(
+        self,
+        load: _Load,
+        scope: _Scope,
+        missing: List[Tuple[str, int, int, _Scope, Optional[str]]],
+    ) -> None:
+        name = load.name
+        if name in _BUILTIN_NAMES:
+            return
+        chain = self._resolution_chain(scope)
+        if load.annotation:
+            for candidate in chain:
+                hit = next(
+                    (raw for raw in candidate.imports if raw.name == name), None
+                )
+                if hit is not None:
+                    hit.used = True
+                    return
+                if name in candidate.bindings:
+                    return
+                if candidate.stars:
+                    candidate.stars[0].used = True
+                    return
+            return
+        if name in scope.globals:
+            hit = next(
+                (raw for raw in self.module_scope.imports if raw.name == name),
+                None,
+            )
+            if hit is not None:
+                hit.used = True
+                return
+            if name in self.module_scope.bindings:
+                return
+            missing.append((name, load.lineno, load.col, scope, None))
+            return
+        if name in scope.nonlocals:
+            for outer in chain[1:]:
+                if outer.kind != "function":
+                    continue
+                hit = next((raw for raw in outer.imports if raw.name == name), None)
+                if hit is not None:
+                    hit.used = True
+                    return
+                if name in outer.bindings:
+                    return
+            missing.append((name, load.lineno, load.col, scope, None))
+            return
+        for candidate in chain:
+            hit = next((raw for raw in candidate.imports if raw.name == name), None)
+            if hit is not None:
+                hit.used = True
+                return
+            if name in candidate.bindings:
+                return
+            stars = candidate.stars
+            if stars:
+                for star in stars:
+                    star.used = True
+                missing.append(
+                    (name, load.lineno, load.col, scope, stars[0].module)
+                )
+                return
+        missing.append((name, load.lineno, load.col, scope, None))
+
+    @staticmethod
+    def _merge_raw_imports(raws: List[_RawImport]) -> ImportEntry:
+        winner = min(
+            raws,
+            key=lambda raw: (
+                len(raw.branches),
+                any(tc for _, tc in raw.branches),
+                raw.lineno,
+                raw.col,
+            ),
+        )
+        scope = winner.scope
+        if not winner.branches:
+            branches: Tuple[Tuple[str, ...], ...] = tuple()
+        else:
+            paths = sorted(
+                {
+                    tuple(label for label, _ in raw.branches)
+                    for raw in raws
+                    if raw.branches
+                }
+            )
+            branches = tuple(paths)
+        type_checking = bool(
+            winner.branches
+        ) and all(tc for _, tc in winner.branches)
+        return ImportEntry(
+            name=winner.name,
+            module=winner.module or "",
+            imported=winner.imported,
+            lineno=winner.lineno,
+            col=winner.col,
+            scope_depth=scope.depth,
+            scope=scope.qualified,
+            branches=branches,
+            type_checking=type_checking,
+            used=any(raw.used for raw in raws),
+        )
+
+
+def _render_import_statement(entry: ImportEntry) -> str:
+    """Render an entry back into a canonical import statement"""
+    if entry.imported is None:
+        root = entry.module.split(".")[0]
+        if entry.name == root:
+            return f"import {entry.module}"
+        return f"import {entry.module} as {entry.name}"
+    if entry.imported == "*":
+        return f"from {entry.module} import *"
+    if entry.name == entry.imported:
+        return f"from {entry.module} import {entry.imported}"
+    return f"from {entry.module} import {entry.imported} as {entry.name}"
+
+
+def _render_report(report: ImportReport, indent: int = 2) -> str:
+    """Render an indented, deterministic attribution listing for one file"""
+    lines: List[str] = []
+    current_scope: Optional[str] = None
+    for entry in report.imports:
+        if entry.scope != current_scope:
+            current_scope = entry.scope
+            lines.append(
+                " " * (indent * entry.scope_depth)
+                + f"scope: {entry.scope} (depth {entry.scope_depth})"
+            )
+        branch_text = ""
+        if entry.branches and any(entry.branches):
+            paths = [" > ".join(path) for path in entry.branches if path]
+            branch_text = f" [branch: {' | '.join(paths)}]"
+        tc_text = " [TYPE_CHECKING]" if entry.type_checking else ""
+        status = "used" if entry.used else "UNUSED"
+        lines.append(
+            " " * (indent * (entry.scope_depth + 1))
+            + f"{_render_import_statement(entry)}  # {status}"
+            + tc_text
+            + branch_text
+        )
+    if report.missing:
+        lines.append("missing references:")
+        for ref in report.missing:
+            attributed = (
+                f" (attributed to `from {ref.attributed_to} import *`)"
+                if ref.attributed_to
+                else ""
+            )
+            lines.append(
+                f"  line {ref.lineno}:{ref.col} `{ref.name}` "
+                f"in {ref.scope}{attributed}"
+            )
+    if report.unused:
+        lines.append("unused imports:")
+        for entry in report.unused:
+            lines.append(
+                f"  line {entry.lineno} {_render_import_statement(entry)} "
+                f"in {entry.scope}"
+            )
+    return "\n".join(lines)
